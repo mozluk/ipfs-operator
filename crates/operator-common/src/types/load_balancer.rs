@@ -10,6 +10,7 @@ use crate::{
     types::service::{self, Port, ServiceType},
 };
 
+// Deploy load balancer services according to target replica counts
 #[instrument(skip(client))]
 pub async fn deploy(
     client: Client,
@@ -31,7 +32,7 @@ pub async fn deploy(
     let lb_count = existing_load_balancers.items.len();
 
     if lb_count > replicas as usize {
-        // Handle excess load balancers
+        // Handle excess load balancers by cleaning them up
         let mut set = JoinSet::new();
         for idx in (replicas as usize)..lb_count {
             let cli = client.clone();
@@ -45,7 +46,7 @@ pub async fn deploy(
             res??;
         }
     } else if lb_count < replicas as usize {
-        // Handle insufficient load balancers
+        // Handle insufficient load balancers by creating new ones
         _create(
             client,
             name,
@@ -61,6 +62,7 @@ pub async fn deploy(
     Ok(())
 }
 
+// Retrieve external IP addresses for all load balancer replicas concurrently
 #[instrument(skip(client))]
 pub async fn get_external_ips(
     client: Client,
@@ -92,6 +94,7 @@ pub async fn get_external_ips(
     Ok(external_addrs)
 }
 
+// Delete all load balancer services matching the instance label
 #[instrument(skip(client))]
 pub async fn delete(client: Client, name: String, namespace: String) -> Result<(), Error> {
     let service_api: Api<Service> = Api::namespaced(client.clone(), namespace.as_str());
@@ -127,6 +130,7 @@ pub async fn delete(client: Client, name: String, namespace: String) -> Result<(
     Ok(())
 }
 
+// Wait safely for the load balancer external IP to be provisioned (without panicking on unwrap)
 #[instrument(skip(client))]
 pub async fn wait(
     client: Client,
@@ -138,20 +142,27 @@ pub async fn wait(
     let exists = await_condition(service_api, name.as_str(), external_ip_exists());
     let out = tokio::time::timeout(Duration::from_secs(300), exists).await?;
     match out {
-        Ok(res) => match res.unwrap().status.unwrap().load_balancer.unwrap().ingress {
-            Some(ingress) => {
-                if !ingress.is_empty() {
-                    return Ok(ingress[0].clone().ip.unwrap());
-                } else {
-                    Err(crate::Error::IngressListEmpty)
-                }
+        Ok(res) => {
+            let res = res.map_err(|e| crate::Error::WaitError { source: e })?;
+            // Safely extract optional fields instead of crashing via unwrap chains
+            let status = res.status.as_ref().ok_or(crate::Error::IngressListMissing)?;
+            let lb = status.load_balancer.as_ref().ok_or(crate::Error::IngressListMissing)?;
+            let ingress = lb.ingress.as_ref().ok_or(crate::Error::IngressListMissing)?;
+            if ingress.is_empty() {
+                return Err(crate::Error::IngressListEmpty);
             }
-            None => Err(crate::Error::IngressListMissing),
-        },
+            let ip = ingress[0]
+                .ip
+                .as_ref()
+                .cloned()
+                .ok_or(crate::Error::IngressListMissing)?;
+            Ok(ip)
+        }
         Err(e) => Err(crate::Error::WaitError { source: e }),
     }
 }
 
+// Condition checker verifying that the external IP is populated on the service status
 #[instrument]
 fn external_ip_exists() -> impl Condition<Service> {
     move |obj: Option<&Service>| {
@@ -167,6 +178,7 @@ fn external_ip_exists() -> impl Condition<Service> {
     }
 }
 
+// Internal helper to create missing load balancer services
 async fn _create(
     client: Client,
     name: String,
